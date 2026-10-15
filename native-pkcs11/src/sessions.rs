@@ -17,7 +17,7 @@ use std::{
     sync::{self, Arc, LazyLock, atomic::Ordering},
 };
 
-use native_pkcs11_traits::{PrivateKey, SignatureAlgorithm};
+use native_pkcs11_traits::{PrivateKey, PublicKey, SignatureAlgorithm};
 use pkcs11_sys::{CK_BYTE_PTR, CK_FLAGS, CK_OBJECT_HANDLE, CK_SESSION_HANDLE, CK_ULONG_PTR};
 
 use crate::{Error, Result, object_store::ObjectStore};
@@ -44,6 +44,13 @@ pub struct SignContext {
     pub private_key: Arc<dyn PrivateKey>,
     /// Payload stored for multipart C_SignUpdate operations.
     pub payload: Option<Vec<u8>>,
+}
+
+#[derive(Debug)]
+pub struct VerifyContext {
+    pub algorithm: SignatureAlgorithm,
+    pub public_key: Arc<dyn PublicKey>,
+    pub key_handle: CK_OBJECT_HANDLE,
 }
 
 impl Session {
@@ -89,6 +96,7 @@ pub struct Session {
     flags: CK_FLAGS,
     pub find_ctx: Option<FindContext>,
     pub sign_ctx: Option<SignContext>,
+    pub verify_ctx: Option<VerifyContext>,
 }
 
 pub fn create(flags: CK_FLAGS) -> CK_SESSION_HANDLE {

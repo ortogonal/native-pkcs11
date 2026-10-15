@@ -27,6 +27,14 @@ pub const SUPPORTED_SIGNATURE_MECHANISMS: &[CK_MECHANISM_TYPE] = &[
     CKM_RSA_PKCS_PSS,
 ];
 
+pub fn mechanism_flags(mechanism: CK_MECHANISM_TYPE) -> Option<CK_FLAGS> {
+    SUPPORTED_SIGNATURE_MECHANISMS.contains(&mechanism).then_some(if mechanism == CKM_ECDSA {
+        CKF_SIGN | CKF_VERIFY
+    } else {
+        CKF_SIGN
+    })
+}
+
 pub enum Mechanism {
     Ecdsa,
     RsaPkcs,
@@ -41,10 +49,21 @@ pub enum Mechanism {
     },
 }
 
+impl Mechanism {
+    pub fn supports_verify(&self) -> bool {
+        matches!(self, Self::Ecdsa)
+    }
+}
+
 #[allow(clippy::missing_safety_doc)]
 pub unsafe fn parse_mechanism(mechanism: CK_MECHANISM) -> Result<Mechanism, Error> {
     match mechanism.mechanism {
-        CKM_ECDSA => Ok(Mechanism::Ecdsa),
+        CKM_ECDSA => {
+            if !mechanism.pParameter.is_null() || mechanism.ulParameterLen != 0 {
+                return Err(Error::MechanismParamInvalid(CKM_ECDSA));
+            }
+            Ok(Mechanism::Ecdsa)
+        }
         CKM_RSA_PKCS => Ok(Mechanism::RsaPkcs),
         CKM_SHA1_RSA_PKCS => Ok(Mechanism::RsaPkcsSha1),
         CKM_SHA256_RSA_PKCS => Ok(Mechanism::RsaPkcsSha256),
@@ -57,7 +76,7 @@ pub unsafe fn parse_mechanism(mechanism: CK_MECHANISM) -> Result<Mechanism, Erro
             let parameter_len = mechanism.ulParameterLen;
             if parameter_ptr.is_null() {
                 tracing::error!("pParameter null");
-                return Err(Error::MechanismInvalid(mechanism_type));
+                return Err(Error::MechanismParamInvalid(mechanism_type));
             }
             if (parameter_len as usize) != std::mem::size_of::<CK_RSA_PKCS_PSS_PARAMS>() {
                 tracing::error!(
@@ -65,11 +84,11 @@ pub unsafe fn parse_mechanism(mechanism: CK_MECHANISM) -> Result<Mechanism, Erro
                     parameter_len,
                     std::mem::size_of::<CK_RSA_PKCS_PSS_PARAMS>()
                 );
-                return Err(Error::MechanismInvalid(mechanism_type));
+                return Err(Error::MechanismParamInvalid(mechanism_type));
             }
             //  TODO(kcking): check alignment as well?
             let params: CK_RSA_PKCS_PSS_PARAMS =
-                unsafe { (parameter_ptr as *mut CK_RSA_PKCS_PSS_PARAMS).read() };
+                unsafe { (parameter_ptr as *const CK_RSA_PKCS_PSS_PARAMS).read_unaligned() };
             let mgf = params.mgf;
             let hash_alg = params.hashAlg;
             let salt_len = params.sLen;
@@ -82,7 +101,7 @@ pub unsafe fn parse_mechanism(mechanism: CK_MECHANISM) -> Result<Mechanism, Erro
                 CKG_MGF1_SHA512 => DigestType::Sha512,
                 _ => {
                     tracing::error!("Unsupported mgf: {}", mgf);
-                    return Err(Error::MechanismInvalid(mechanism_type));
+                    return Err(Error::MechanismParamInvalid(mechanism_type));
                 }
             };
 
@@ -94,7 +113,7 @@ pub unsafe fn parse_mechanism(mechanism: CK_MECHANISM) -> Result<Mechanism, Erro
                 CKM_SHA512 => DigestType::Sha512,
                 _ => {
                     tracing::error!("Unsupported hashAlg: {}", hash_alg);
-                    return Err(Error::MechanismInvalid(mechanism_type));
+                    return Err(Error::MechanismParamInvalid(mechanism_type));
                 }
             };
 
@@ -141,5 +160,58 @@ impl From<Mechanism> for SignatureAlgorithm {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_raw_ecdsa_and_rejects_combined_sha256() {
+        let raw = CK_MECHANISM {
+            mechanism: CKM_ECDSA,
+            pParameter: std::ptr::null_mut(),
+            ulParameterLen: 0,
+        };
+        assert!(matches!(unsafe { parse_mechanism(raw) }, Ok(Mechanism::Ecdsa)));
+
+        let combined = CK_MECHANISM {
+            mechanism: CKM_ECDSA_SHA256,
+            pParameter: std::ptr::null_mut(),
+            ulParameterLen: 0,
+        };
+        assert!(unsafe { parse_mechanism(combined) }.is_err());
+    }
+
+    #[test]
+    fn rejects_parameters_for_raw_ecdsa() {
+        let parameter = 0u8;
+        for mechanism in [
+            CK_MECHANISM {
+                mechanism: CKM_ECDSA,
+                pParameter: &parameter as *const _ as *mut _,
+                ulParameterLen: 0,
+            },
+            CK_MECHANISM {
+                mechanism: CKM_ECDSA,
+                pParameter: std::ptr::null_mut(),
+                ulParameterLen: 1,
+            },
+        ] {
+            assert!(matches!(
+                unsafe { parse_mechanism(mechanism) },
+                Err(Error::MechanismParamInvalid(CKM_ECDSA))
+            ));
+        }
+    }
+
+    #[test]
+    fn advertises_verification_only_for_raw_ecdsa() {
+        assert_eq!(mechanism_flags(CKM_ECDSA), Some(CKF_SIGN | CKF_VERIFY));
+        assert_eq!(mechanism_flags(CKM_RSA_PKCS), Some(CKF_SIGN));
+        assert_eq!(mechanism_flags(CKM_ECDSA_SHA256), None);
+        assert!(Mechanism::Ecdsa.supports_verify());
+        assert!(!Mechanism::RsaPkcs.supports_verify());
     }
 }

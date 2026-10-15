@@ -207,6 +207,10 @@ impl Object {
             },
             Object::PublicKey(pk) => match type_ {
                 AttributeType::Class => Some(Attribute::Class(CKO_PUBLIC_KEY)),
+                AttributeType::Verify => Some(Attribute::Verify(
+                    pk.algorithm() == native_pkcs11_traits::KeyAlgorithm::Ecc
+                        && pk.ec_params() == Some(P256_OID.to_der().unwrap()),
+                )),
                 AttributeType::Derive => Some(Attribute::Derive(false)),
                 AttributeType::Label => Some(Attribute::Label(pk.label())),
                 AttributeType::Local => Some(Attribute::Local(false)),
@@ -328,6 +332,8 @@ mod tests {
         let (point, params) = generated_p256_key();
         let object = object(TestPublicKey { point: point.clone(), params: Some(params.clone()) });
 
+        assert_eq!(object.attribute(AttributeType::Verify), Some(Attribute::Verify(true)));
+
         let ec_point = match object.attribute(AttributeType::EcPoint).unwrap() {
             Attribute::EcPoint(value) => OctetString::from_der(&value).unwrap(),
             other => panic!("unexpected attribute: {other:?}"),
@@ -359,6 +365,7 @@ mod tests {
         assert!(missing_params.attribute(AttributeType::EcPoint).is_some());
         assert!(missing_params.attribute(AttributeType::EcParams).is_none());
         assert!(missing_params.attribute(AttributeType::PublicKeyInfo).is_none());
+        assert_eq!(missing_params.attribute(AttributeType::Verify), Some(Attribute::Verify(false)));
     }
 
     #[test]
@@ -391,6 +398,7 @@ mod tests {
         let (point, params) = generated_p256_key();
         let key = TestPublicKey { point, params: Some(params) };
         let object = Object::PublicKey(Arc::new(RsaTestPublicKey(key)) as Arc<dyn PublicKey>);
+        assert_eq!(object.attribute(AttributeType::Verify), Some(Attribute::Verify(false)));
         assert!(object.attribute(AttributeType::EcPoint).is_none());
         assert!(object.attribute(AttributeType::EcParams).is_none());
         assert!(object.attribute(AttributeType::PublicKeyInfo).is_none());

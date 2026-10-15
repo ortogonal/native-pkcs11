@@ -66,11 +66,17 @@ impl PublicKey for SessionPublicKey {
 
     fn verify(
         &self,
-        _algorithm: &SignatureAlgorithm,
-        _data: &[u8],
-        _signature: &[u8],
+        algorithm: &SignatureAlgorithm,
+        data: &[u8],
+        signature: &[u8],
     ) -> native_pkcs11_traits::Result<()> {
-        Err("temporary public-key verification is not implemented".into())
+        if !matches!(algorithm, SignatureAlgorithm::Ecdsa) {
+            return Err("unsupported temporary public-key verification mechanism".into());
+        }
+        let signature = p256::ecdsa::Signature::from_slice(signature)?;
+        use p256::ecdsa::signature::hazmat::PrehashVerifier;
+        self.key.verify_prehash(data, &signature)?;
+        Ok(())
     }
 
     fn delete(self: Box<Self>) {}
@@ -79,7 +85,7 @@ impl PublicKey for SessionPublicKey {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use p256::ecdsa::SigningKey;
+    use p256::ecdsa::{SigningKey, signature::hazmat::PrehashSigner};
 
     fn key() -> (SessionPublicKey, SigningKey) {
         let signing_key = SigningKey::from_bytes((&[7u8; 32]).into()).unwrap();

@@ -114,6 +114,15 @@ impl ObjectStore {
         self.objects.get(handle)
     }
 
+    pub fn get_for_session(
+        &self,
+        session: CK_SESSION_HANDLE,
+        handle: &CK_OBJECT_HANDLE,
+    ) -> Option<&Object> {
+        let _ = session;
+        self.objects.get(handle)
+    }
+
     #[instrument(skip(self))]
     pub fn find(&mut self, template: Attributes) -> Result<Vec<CK_OBJECT_HANDLE>> {
         // Cache certificates.

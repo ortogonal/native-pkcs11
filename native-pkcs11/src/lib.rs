@@ -17,7 +17,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub use native_pkcs11_core::Error;
-use native_pkcs11_traits::backend;
+use native_pkcs11_traits::{SignatureAlgorithm, backend};
 use tracing::metadata::LevelFilter;
 use tracing_error::ErrorLayer;
 use tracing_subscriber::{EnvFilter, Registry, fmt::format::FmtSpan, prelude::*};
@@ -39,14 +39,14 @@ use std::{
 use der::{Decode, asn1::OctetString};
 use native_pkcs11_core::{
     attribute::{Attribute, AttributeType, Attributes},
-    mechanism::{SUPPORTED_SIGNATURE_MECHANISMS, parse_mechanism},
+    mechanism::{SUPPORTED_SIGNATURE_MECHANISMS, mechanism_flags, parse_mechanism},
     object::{self, Object},
 };
 use pkcs11_sys::*;
 
 use crate::{
-    sessions::{FindContext, SignContext},
     session_public_key::SessionPublicKey,
+    sessions::{FindContext, SignContext, VerifyContext},
     utils::right_pad_string_to_array,
 };
 
@@ -527,10 +527,8 @@ cryptoki_fn!(
         initialized!();
         valid_slot!(slotID);
         not_null!(pInfo);
-        if !SUPPORTED_SIGNATURE_MECHANISMS.contains(&mechType) {
-            return Err(Error::MechanismInvalid(mechType));
-        }
-        let info = CK_MECHANISM_INFO { flags: CKF_SIGN, ..Default::default() };
+        let flags = mechanism_flags(mechType).ok_or(Error::MechanismInvalid(mechType))?;
+        let info = CK_MECHANISM_INFO { flags, ..Default::default() };
         unsafe { *pInfo = info };
         Ok(())
     }
@@ -1046,20 +1044,110 @@ cryptoki_fn_not_supported!(
     pulSignatureLen: CK_ULONG_PTR
 );
 
-cryptoki_fn_not_supported!(
-    C_VerifyInit,
-    hSession: CK_SESSION_HANDLE,
-    pMechanism: CK_MECHANISM_PTR,
-    hKey: CK_OBJECT_HANDLE
+cryptoki_fn!(
+    unsafe fn C_VerifyInit(
+        hSession: CK_SESSION_HANDLE,
+        pMechanism: CK_MECHANISM_PTR,
+        hKey: CK_OBJECT_HANDLE,
+    ) {
+        initialized!();
+        valid_session!(hSession);
+        not_null!(pMechanism);
+        sessions::session(hSession, |session| -> Result {
+            if session.verify_ctx.is_some() {
+                return Err(Error::OperationActive);
+            }
+            let mechanism = unsafe { parse_mechanism(pMechanism.read()) }?;
+            if !mechanism.supports_verify() {
+                return Err(Error::MechanismInvalid(mechanism.into()));
+            }
+            let object_store = sessions::OBJECT_STORE.lock().unwrap();
+            let object = object_store
+                .get_for_session(hSession, &hKey)
+                .ok_or(Error::KeyHandleInvalid(hKey))?;
+            let public_key = object.public_key().cloned().ok_or(Error::KeyHandleInvalid(hKey))?;
+            let key_type =
+                object.attribute(AttributeType::KeyType).ok_or(Error::KeyHandleInvalid(hKey))?;
+            let key_type = match key_type {
+                Attribute::KeyType(key_type) => key_type,
+                _ => return Err(Error::KeyTypeInconsistent),
+            };
+            if key_type != CKK_EC {
+                return Err(Error::KeyTypeInconsistent);
+            }
+            if object.attribute(AttributeType::EcParams)
+                != Some(Attribute::EcParams(P256_EC_PARAMS_DER.to_vec()))
+            {
+                return Err(Error::KeyTypeInconsistent);
+            }
+            if object.attribute(AttributeType::Verify) != Some(Attribute::Verify(true)) {
+                return Err(Error::KeyFunctionNotPermitted);
+            }
+            session.verify_ctx =
+                Some(VerifyContext { algorithm: mechanism.into(), public_key, key_handle: hKey });
+            Ok(())
+        })
+    }
 );
 
-cryptoki_fn_not_supported!(
-    C_Verify,
-    hSession: CK_SESSION_HANDLE,
-    pData: CK_BYTE_PTR,
-    ulDataLen: CK_ULONG,
-    pSignature: CK_BYTE_PTR,
-    ulSignatureLen: CK_ULONG
+cryptoki_fn!(
+    unsafe fn C_Verify(
+        hSession: CK_SESSION_HANDLE,
+        pData: CK_BYTE_PTR,
+        ulDataLen: CK_ULONG,
+        pSignature: CK_BYTE_PTR,
+        ulSignatureLen: CK_ULONG,
+    ) {
+        initialized!();
+        valid_session!(hSession);
+        if ulDataLen != 0 {
+            not_null!(pData);
+        }
+        if ulSignatureLen != 0 {
+            not_null!(pSignature);
+        }
+        sessions::session(hSession, |session| -> Result {
+            let verify_ctx = session.verify_ctx.take().ok_or(Error::OperationNotInitialized)?;
+            if sessions::OBJECT_STORE
+                .lock()
+                .unwrap()
+                .get(&verify_ctx.key_handle)
+                .and_then(Object::public_key)
+                .is_none()
+            {
+                return Err(Error::KeyHandleInvalid(verify_ctx.key_handle));
+            }
+            let data = if ulDataLen == 0 {
+                &[]
+            } else {
+                unsafe { slice::from_raw_parts(pData, ulDataLen as usize) }
+            };
+            let signature = if ulSignatureLen == 0 {
+                &[]
+            } else {
+                unsafe { slice::from_raw_parts(pSignature, ulSignatureLen as usize) }
+            };
+            if matches!(verify_ctx.algorithm, SignatureAlgorithm::Ecdsa) {
+                // RustCrypto's P-256 prehash adapter accepts digests of at least
+                // half the field size and truncates longer inputs to 32 bytes.
+                if data.len() < 16 {
+                    return Err(Error::DataLenRange);
+                }
+                if signature.len() != 64 {
+                    return Err(Error::SignatureLenRange);
+                }
+                p256::ecdsa::Signature::from_slice(signature)
+                    .map_err(|_| Error::SignatureInvalid)?;
+            }
+            verify_ctx.public_key.verify(&verify_ctx.algorithm, data, signature).map_err(|error| {
+                if matches!(verify_ctx.algorithm, SignatureAlgorithm::Ecdsa) {
+                    Error::SignatureInvalid
+                } else {
+                    Error::Backend(error)
+                }
+            })
+        })
+    }
 );
 
 cryptoki_fn_not_supported!(
@@ -1243,6 +1331,74 @@ pub mod tests {
         }
     }
 
+    fn open_test_session() -> CK_SESSION_HANDLE {
+        let mut session = CK_INVALID_HANDLE;
+        assert_eq!(
+            unsafe {
+                C_OpenSession(
+                    SLOT_ID,
+                    CKF_SERIAL_SESSION | CKF_RW_SESSION,
+                    ptr::null_mut(),
+                    None,
+                    &mut session,
+                )
+            },
+            CKR_OK
+        );
+        session
+    }
+
+    fn raw_ecdsa_mechanism() -> CK_MECHANISM {
+        CK_MECHANISM { mechanism: CKM_ECDSA, pParameter: ptr::null_mut(), ulParameterLen: 0 }
+    }
+
+    fn create_test_public_key(
+        session: CK_SESSION_HANDLE,
+        signing_key: &p256::ecdsa::SigningKey,
+    ) -> CK_OBJECT_HANDLE {
+        let point = signing_key.verifying_key().to_encoded_point(false);
+        let point_der =
+            der::asn1::OctetString::new(point.as_bytes().to_vec()).unwrap().to_der().unwrap();
+        let mut class = CKO_PUBLIC_KEY as CK_ULONG;
+        let mut key_type = CKK_EC as CK_ULONG;
+        let mut params = P256_EC_PARAMS_DER.to_vec();
+        let mut template = [
+            CK_ATTRIBUTE {
+                type_: CKA_CLASS,
+                pValue: (&mut class as *mut CK_ULONG).cast(),
+                ulValueLen: std::mem::size_of::<CK_ULONG>() as CK_ULONG,
+            },
+            CK_ATTRIBUTE {
+                type_: CKA_KEY_TYPE,
+                pValue: (&mut key_type as *mut CK_ULONG).cast(),
+                ulValueLen: std::mem::size_of::<CK_ULONG>() as CK_ULONG,
+            },
+            CK_ATTRIBUTE {
+                type_: CKA_EC_PARAMS,
+                pValue: params.as_mut_ptr().cast(),
+                ulValueLen: params.len() as CK_ULONG,
+            },
+            CK_ATTRIBUTE {
+                type_: CKA_EC_POINT,
+                pValue: point_der.as_ptr() as *mut _,
+                ulValueLen: point_der.len() as CK_ULONG,
+            },
+        ];
+        let mut handle = CK_INVALID_HANDLE;
+        assert_eq!(
+            unsafe {
+                C_CreateObject(
+                    session,
+                    template.as_mut_ptr(),
+                    template.len() as CK_ULONG,
+                    &mut handle,
+                )
+            },
+            CKR_OK
+        );
+        handle
+    }
+
     #[test]
     #[serial]
     fn get_initialize() {
@@ -1417,6 +1573,18 @@ pub mod tests {
             unsafe { C_GetMechanismInfo(SLOT_ID, SUPPORTED_SIGNATURE_MECHANISMS[0], &mut info) },
             CKR_OK
         );
+        assert_eq!(info.flags, CKF_SIGN);
+        assert_eq!(unsafe { C_GetMechanismInfo(SLOT_ID, CKM_ECDSA, &mut info) }, CKR_OK);
+        assert_eq!(info.flags, CKF_SIGN | CKF_VERIFY);
+        for mechanism in SUPPORTED_SIGNATURE_MECHANISMS {
+            unsafe { C_GetMechanismInfo(SLOT_ID, *mechanism, &mut info) };
+            if *mechanism == CKM_ECDSA {
+                assert_eq!(info.flags, CKF_SIGN | CKF_VERIFY);
+            } else {
+                assert_eq!(info.flags, CKF_SIGN);
+                assert_eq!(info.flags & CKF_VERIFY, 0);
+            }
+        }
         // Expect CKR_MECHANISM_INVALID if type is an unsupported mechanism.
         assert_eq!(
             unsafe { C_GetMechanismInfo(SLOT_ID, CKM_DSA, &mut info) },
@@ -1990,6 +2158,353 @@ pub mod tests {
             CKR_OBJECT_HANDLE_INVALID
         );
         assert_eq!(C_CloseSession(first), CKR_OK);
+        assert_eq!(C_CloseSession(second), CKR_OK);
+        assert_eq!(C_Finalize(ptr::null_mut()), CKR_OK);
+    }
+
+    #[test]
+    #[serial]
+    fn creates_verifies_and_destroys_session_public_key() {
+        use p256::ecdsa::{SigningKey, signature::hazmat::PrehashSigner};
+
+        test_init();
+        assert_eq!(C_Initialize(ptr::null_mut()), CKR_OK);
+
+        let mut session = CK_INVALID_HANDLE;
+        assert_eq!(
+            unsafe {
+                C_OpenSession(
+                    SLOT_ID,
+                    CKF_SERIAL_SESSION | CKF_RW_SESSION,
+                    ptr::null_mut(),
+                    None,
+                    &mut session,
+                )
+            },
+            CKR_OK
+        );
+
+        let signing_key = SigningKey::from_bytes((&[9u8; 32]).into()).unwrap();
+        let point = signing_key.verifying_key().to_encoded_point(false);
+        let mut ec_point = vec![0x04, point.as_bytes().len() as u8];
+        ec_point.extend_from_slice(point.as_bytes());
+        let mut class = CKO_PUBLIC_KEY as CK_ULONG;
+        let mut key_type = CKK_EC as CK_ULONG;
+        let mut token = CK_FALSE;
+        let mut params = P256_EC_PARAMS_DER.to_vec();
+        let mut template = [
+            CK_ATTRIBUTE {
+                type_: CKA_CLASS,
+                pValue: (&mut class as *mut CK_ULONG).cast(),
+                ulValueLen: std::mem::size_of::<CK_ULONG>() as CK_ULONG,
+            },
+            CK_ATTRIBUTE {
+                type_: CKA_KEY_TYPE,
+                pValue: (&mut key_type as *mut CK_ULONG).cast(),
+                ulValueLen: std::mem::size_of::<CK_ULONG>() as CK_ULONG,
+            },
+            CK_ATTRIBUTE {
+                type_: CKA_TOKEN,
+                pValue: (&mut token as *mut CK_BBOOL).cast(),
+                ulValueLen: std::mem::size_of::<CK_BBOOL>() as CK_ULONG,
+            },
+            CK_ATTRIBUTE {
+                type_: CKA_EC_PARAMS,
+                pValue: params.as_mut_ptr().cast(),
+                ulValueLen: params.len() as CK_ULONG,
+            },
+            CK_ATTRIBUTE {
+                type_: CKA_EC_POINT,
+                pValue: ec_point.as_mut_ptr().cast(),
+                ulValueLen: ec_point.len() as CK_ULONG,
+            },
+        ];
+
+        let mut public_handle = CK_INVALID_HANDLE;
+        assert_eq!(
+            unsafe {
+                C_CreateObject(
+                    session,
+                    template.as_mut_ptr(),
+                    template.len() as CK_ULONG,
+                    &mut public_handle,
+                )
+            },
+            CKR_OK
+        );
+
+        let mechanism =
+            CK_MECHANISM { mechanism: CKM_ECDSA, pParameter: ptr::null_mut(), ulParameterLen: 0 };
+        assert_eq!(
+            unsafe { C_VerifyInit(session, &mechanism as *const _ as *mut _, public_handle) },
+            CKR_OK
+        );
+
+        let digest = [0x5Au8; 32];
+        let signature: p256::ecdsa::Signature = signing_key.sign_prehash(&digest).unwrap();
+        let mut signature_bytes = signature.to_bytes().to_vec();
+        let mut digest_bytes = digest;
+        assert_eq!(
+            unsafe {
+                C_Verify(
+                    session,
+                    digest_bytes.as_mut_ptr(),
+                    digest_bytes.len() as CK_ULONG,
+                    signature_bytes.as_mut_ptr(),
+                    signature_bytes.len() as CK_ULONG,
+                )
+            },
+            CKR_OK
+        );
+        assert_eq!(
+            unsafe {
+                C_Verify(
+                    session,
+                    digest_bytes.as_mut_ptr(),
+                    digest_bytes.len() as CK_ULONG,
+                    signature_bytes.as_mut_ptr(),
+                    signature_bytes.len() as CK_ULONG,
+                )
+            },
+            CKR_OPERATION_NOT_INITIALIZED
+        );
+
+        assert_eq!(C_DestroyObject(session, public_handle), CKR_OK);
+        assert_eq!(C_DestroyObject(session, public_handle), CKR_OBJECT_HANDLE_INVALID);
+        assert_eq!(C_CloseSession(session), CKR_OK);
+        assert_eq!(C_Finalize(ptr::null_mut()), CKR_OK);
+    }
+
+    #[test]
+    #[serial]
+    fn verify_init_and_verify_return_defined_errors_and_consume_operation() {
+        use p256::ecdsa::{SigningKey, signature::hazmat::PrehashSigner};
+
+        test_init();
+        assert_eq!(C_Initialize(ptr::null_mut()), CKR_OK);
+        let session = open_test_session();
+        let signing_key = SigningKey::from_bytes((&[11u8; 32]).into()).unwrap();
+        let public_handle = create_test_public_key(session, &signing_key);
+        let mut mechanism = raw_ecdsa_mechanism();
+
+        assert_eq!(unsafe { C_VerifyInit(session, &mut mechanism, public_handle) }, CKR_OK);
+        assert_eq!(
+            unsafe { C_VerifyInit(session, &mut mechanism, public_handle) },
+            CKR_OPERATION_ACTIVE
+        );
+
+        let digest = [0x5Au8; 32];
+        let signature: p256::ecdsa::Signature = signing_key.sign_prehash(&digest).unwrap();
+        let mut signature_bytes = signature.to_bytes().to_vec();
+        signature_bytes[0] ^= 1;
+        assert_eq!(
+            unsafe {
+                C_Verify(
+                    session,
+                    digest.as_ptr() as *mut _,
+                    digest.len() as CK_ULONG,
+                    signature_bytes.as_mut_ptr(),
+                    signature_bytes.len() as CK_ULONG,
+                )
+            },
+            CKR_SIGNATURE_INVALID
+        );
+        assert_eq!(
+            unsafe {
+                C_Verify(
+                    session,
+                    digest.as_ptr() as *mut _,
+                    digest.len() as CK_ULONG,
+                    signature_bytes.as_mut_ptr(),
+                    signature_bytes.len() as CK_ULONG,
+                )
+            },
+            CKR_OPERATION_NOT_INITIALIZED
+        );
+
+        assert_eq!(unsafe { C_VerifyInit(session, &mut mechanism, public_handle) }, CKR_OK);
+        let mut malformed_signature = vec![0u8; 64];
+        assert_eq!(
+            unsafe {
+                C_Verify(
+                    session,
+                    digest.as_ptr() as *mut _,
+                    digest.len() as CK_ULONG,
+                    malformed_signature.as_mut_ptr(),
+                    malformed_signature.len() as CK_ULONG,
+                )
+            },
+            CKR_SIGNATURE_INVALID
+        );
+
+        assert_eq!(unsafe { C_VerifyInit(session, &mut mechanism, public_handle) }, CKR_OK);
+        let mut short_signature = vec![0u8; 63];
+        assert_eq!(
+            unsafe {
+                C_Verify(
+                    session,
+                    digest.as_ptr() as *mut _,
+                    digest.len() as CK_ULONG,
+                    short_signature.as_mut_ptr(),
+                    short_signature.len() as CK_ULONG,
+                )
+            },
+            CKR_SIGNATURE_LEN_RANGE
+        );
+
+        assert_eq!(unsafe { C_VerifyInit(session, &mut mechanism, public_handle) }, CKR_OK);
+        let mut oversized_signature = vec![0u8; 65];
+        assert_eq!(
+            unsafe {
+                C_Verify(
+                    session,
+                    digest.as_ptr() as *mut _,
+                    digest.len() as CK_ULONG,
+                    oversized_signature.as_mut_ptr(),
+                    oversized_signature.len() as CK_ULONG,
+                )
+            },
+            CKR_SIGNATURE_LEN_RANGE
+        );
+
+        assert_eq!(unsafe { C_VerifyInit(session, &mut mechanism, public_handle) }, CKR_OK);
+        let mut long_digest = vec![0u8; 33];
+        let long_signature: p256::ecdsa::Signature =
+            signing_key.sign_prehash(&long_digest).unwrap();
+        let mut valid_signature = long_signature.to_bytes().to_vec();
+        assert_eq!(
+            unsafe {
+                C_Verify(
+                    session,
+                    long_digest.as_mut_ptr(),
+                    long_digest.len() as CK_ULONG,
+                    valid_signature.as_mut_ptr(),
+                    valid_signature.len() as CK_ULONG,
+                )
+            },
+            CKR_OK
+        );
+
+        assert_eq!(unsafe { C_VerifyInit(session, &mut mechanism, public_handle) }, CKR_OK);
+        let short_digest = vec![0x3Cu8; 16];
+        let short_signature: p256::ecdsa::Signature =
+            signing_key.sign_prehash(&short_digest).unwrap();
+        let mut short_signature = short_signature.to_bytes().to_vec();
+        assert_eq!(
+            unsafe {
+                C_Verify(
+                    session,
+                    short_digest.as_ptr() as *mut _,
+                    short_digest.len() as _,
+                    short_signature.as_mut_ptr(),
+                    short_signature.len() as _,
+                )
+            },
+            CKR_OK
+        );
+
+        assert_eq!(C_CloseSession(session), CKR_OK);
+        assert_eq!(C_Finalize(ptr::null_mut()), CKR_OK);
+    }
+
+    #[test]
+    #[serial]
+    fn verify_init_rejects_invalid_handles_mechanisms_and_parameters() {
+        test_init();
+        assert_eq!(C_Initialize(ptr::null_mut()), CKR_OK);
+        let session = open_test_session();
+        let mut mechanism = raw_ecdsa_mechanism();
+        let signing_key = p256::ecdsa::SigningKey::from_bytes((&[13u8; 32]).into()).unwrap();
+        let public_handle = create_test_public_key(session, &signing_key);
+
+        assert_eq!(
+            unsafe { C_VerifyInit(session, &mut mechanism, CK_INVALID_HANDLE) },
+            CKR_KEY_HANDLE_INVALID
+        );
+        mechanism.mechanism = CKM_DSA;
+        assert_eq!(
+            unsafe { C_VerifyInit(session, &mut mechanism, public_handle) },
+            CKR_MECHANISM_INVALID
+        );
+
+        mechanism.mechanism = CKM_RSA_PKCS;
+        assert_eq!(
+            unsafe { C_VerifyInit(session, &mut mechanism, public_handle) },
+            CKR_MECHANISM_INVALID
+        );
+
+        mechanism.mechanism = CKM_ECDSA_SHA256;
+        assert_eq!(
+            unsafe { C_VerifyInit(session, &mut mechanism, public_handle) },
+            CKR_MECHANISM_INVALID
+        );
+
+        mechanism = raw_ecdsa_mechanism();
+        let parameter = 0u8;
+        mechanism.pParameter = &parameter as *const _ as *mut _;
+        assert_eq!(
+            unsafe { C_VerifyInit(session, &mut mechanism, public_handle) },
+            CKR_MECHANISM_PARAM_INVALID
+        );
+        assert_eq!(
+            unsafe { C_Verify(session, ptr::null_mut(), 0, ptr::null_mut(), 0) },
+            CKR_OPERATION_NOT_INITIALIZED
+        );
+
+        assert_eq!(C_CloseSession(session), CKR_OK);
+        assert_eq!(C_Finalize(ptr::null_mut()), CKR_OK);
+    }
+
+    #[test]
+    #[serial]
+    fn session_public_keys_are_visible_and_invalidation_is_observed() {
+        use p256::ecdsa::SigningKey;
+
+        test_init();
+        assert_eq!(C_Initialize(ptr::null_mut()), CKR_OK);
+        let first = open_test_session();
+        let second = open_test_session();
+        let signing_key = SigningKey::from_bytes((&[17u8; 32]).into()).unwrap();
+        let public_handle = create_test_public_key(first, &signing_key);
+        let mut mechanism = raw_ecdsa_mechanism();
+
+        assert_eq!(unsafe { C_VerifyInit(second, &mut mechanism, public_handle) }, CKR_OK);
+        assert_eq!(unsafe { C_VerifyInit(first, &mut mechanism, public_handle) }, CKR_OK);
+        assert_eq!(C_CloseSession(first), CKR_OK);
+        let digest = [0x5Au8; 32];
+        let mut signature = vec![0u8; 64];
+        assert_eq!(
+            unsafe {
+                C_Verify(
+                    second,
+                    digest.as_ptr() as *mut _,
+                    digest.len() as _,
+                    signature.as_mut_ptr(),
+                    signature.len() as _,
+                )
+            },
+            CKR_KEY_HANDLE_INVALID
+        );
+        assert_eq!(C_CloseSession(second), CKR_OK);
+        assert_eq!(C_Finalize(ptr::null_mut()), CKR_OK);
+    }
+
+    #[test]
+    #[serial]
+    fn provider_session_object_is_removed_when_connection_session_closes() {
+        test_init();
+        assert_eq!(C_Initialize(ptr::null_mut()), CKR_OK);
+        let first = open_test_session();
+        let signing_key = p256::ecdsa::SigningKey::from_bytes((&[19u8; 32]).into()).unwrap();
+        let public_handle = create_test_public_key(first, &signing_key);
+        assert_eq!(C_CloseSession(first), CKR_OK);
+
+        let second = open_test_session();
+        let mut mechanism = raw_ecdsa_mechanism();
+        assert_eq!(
+            unsafe { C_VerifyInit(second, &mut mechanism, public_handle) },
+            CKR_KEY_HANDLE_INVALID
+        );
         assert_eq!(C_CloseSession(second), CKR_OK);
         assert_eq!(C_Finalize(ptr::null_mut()), CKR_OK);
     }

@@ -58,11 +58,20 @@ pub enum Error {
     #[error("{0} is not a valid mechanism")]
     MechanismInvalid(CK_MECHANISM_TYPE),
 
+    #[error("mechanism parameters are invalid")]
+    MechanismParamInvalid(CK_MECHANISM_TYPE),
+
     #[error("object {0} is invalid")]
     ObjectHandleInvalid(CK_OBJECT_HANDLE),
 
     #[error("object handle space is exhausted")]
     ObjectHandleExhausted,
+
+    #[error("key type is inconsistent with the mechanism")]
+    KeyTypeInconsistent,
+
+    #[error("key function is not permitted")]
+    KeyFunctionNotPermitted,
 
     #[error("the object template is incomplete")]
     TemplateIncomplete,
@@ -72,6 +81,18 @@ pub enum Error {
 
     #[error("operation has not been initialized")]
     OperationNotInitialized,
+
+    #[error("operation is already active")]
+    OperationActive,
+
+    #[error("data length is out of range")]
+    DataLenRange,
+
+    #[error("signature is invalid")]
+    SignatureInvalid,
+
+    #[error("signature length is out of range")]
+    SignatureLenRange,
 
     #[error("no random number generator")]
     RandomNoRng,
@@ -129,10 +150,17 @@ impl From<Error> for CK_RV {
             Error::FunctionNotSupported => CKR_FUNCTION_NOT_SUPPORTED,
             Error::KeyHandleInvalid(_) => CKR_KEY_HANDLE_INVALID,
             Error::MechanismInvalid(_) => CKR_MECHANISM_INVALID,
+            Error::MechanismParamInvalid(_) => CKR_MECHANISM_PARAM_INVALID,
             Error::NeedToCreateThreads => CKR_NEED_TO_CREATE_THREADS,
             Error::ObjectHandleInvalid(_) => CKR_OBJECT_HANDLE_INVALID,
             Error::ObjectHandleExhausted => CKR_GENERAL_ERROR,
+            Error::KeyTypeInconsistent => CKR_KEY_TYPE_INCONSISTENT,
+            Error::KeyFunctionNotPermitted => CKR_KEY_FUNCTION_NOT_PERMITTED,
             Error::OperationNotInitialized => CKR_OPERATION_NOT_INITIALIZED,
+            Error::OperationActive => CKR_OPERATION_ACTIVE,
+            Error::DataLenRange => CKR_DATA_LEN_RANGE,
+            Error::SignatureInvalid => CKR_SIGNATURE_INVALID,
+            Error::SignatureLenRange => CKR_SIGNATURE_LEN_RANGE,
             Error::RandomNoRng => CKR_RANDOM_NO_RNG,
             Error::SessionHandleInvalid(_) => CKR_SESSION_HANDLE_INVALID,
             Error::SessionParallelNotSupported => CKR_SESSION_PARALLEL_NOT_SUPPORTED,
@@ -152,5 +180,24 @@ impl From<Error> for CK_RV {
             #[cfg(target_os = "macos")]
             Error::Pkcs11Keychain(_) => CKR_GENERAL_ERROR,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_verification_errors_to_pkcs11_return_codes() {
+        assert_eq!(CK_RV::from(Error::OperationActive), CKR_OPERATION_ACTIVE);
+        assert_eq!(
+            CK_RV::from(Error::MechanismParamInvalid(CKM_ECDSA)),
+            CKR_MECHANISM_PARAM_INVALID
+        );
+        assert_eq!(CK_RV::from(Error::DataLenRange), CKR_DATA_LEN_RANGE);
+        assert_eq!(CK_RV::from(Error::SignatureInvalid), CKR_SIGNATURE_INVALID);
+        assert_eq!(CK_RV::from(Error::SignatureLenRange), CKR_SIGNATURE_LEN_RANGE);
+        assert_eq!(CK_RV::from(Error::KeyTypeInconsistent), CKR_KEY_TYPE_INCONSISTENT);
+        assert_eq!(CK_RV::from(Error::KeyFunctionNotPermitted), CKR_KEY_FUNCTION_NOT_PERMITTED);
     }
 }
