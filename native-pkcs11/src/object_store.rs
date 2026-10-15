@@ -21,12 +21,8 @@ use native_pkcs11_core::{
 };
 use native_pkcs11_traits::{KeySearchOptions, backend};
 use pkcs11_sys::{
-    CK_OBJECT_HANDLE,
-    CKO_CERTIFICATE,
-    CKO_PRIVATE_KEY,
-    CKO_PUBLIC_KEY,
-    CKO_SECRET_KEY,
-    CKP_BASELINE_PROVIDER,
+    CK_OBJECT_HANDLE, CK_SESSION_HANDLE, CKO_CERTIFICATE, CKO_PRIVATE_KEY, CKO_PUBLIC_KEY,
+    CKO_SECRET_KEY, CKP_BASELINE_PROVIDER,
 };
 use tracing::{instrument, warn};
 
@@ -36,21 +32,81 @@ use crate::{Error, object::Object};
 pub struct ObjectStore {
     objects: HashMap<CK_OBJECT_HANDLE, Object>,
     handles_by_object: HashMap<Object, CK_OBJECT_HANDLE>,
+    temporary_owners: HashMap<CK_OBJECT_HANDLE, CK_SESSION_HANDLE>,
     next_object_handle: CK_OBJECT_HANDLE,
     query_cache: TtlCache<Attributes, Vec<CK_OBJECT_HANDLE>>,
 }
 
 impl ObjectStore {
-    #[instrument(skip(self))]
-    pub fn insert(&mut self, object: Object) -> CK_OBJECT_HANDLE {
-        if let Some(existing_handle) = self.handles_by_object.get(&object) {
-            return *existing_handle;
+    fn allocate_handle(&mut self) -> Result<CK_OBJECT_HANDLE> {
+        let handle = self.next_object_handle.checked_add(1).ok_or(Error::ObjectHandleExhausted)?;
+        if handle == pkcs11_sys::CK_INVALID_HANDLE || self.objects.contains_key(&handle) {
+            return Err(Error::ObjectHandleExhausted);
         }
-        let handle = self.next_object_handle + 1;
-        self.next_object_handle += 1;
+        self.next_object_handle = handle;
+        Ok(handle)
+    }
+
+    #[instrument(skip(self))]
+    pub fn insert(&mut self, object: Object) -> Result<CK_OBJECT_HANDLE> {
+        if let Some(existing_handle) = self.handles_by_object.get(&object) {
+            return Ok(*existing_handle);
+        }
+        let handle = self.allocate_handle()?;
         self.objects.insert(handle, object.clone());
         self.handles_by_object.insert(object, handle);
-        handle
+        self.query_cache.cache_clear();
+        Ok(handle)
+    }
+
+    pub fn insert_session_object(
+        &mut self,
+        session: CK_SESSION_HANDLE,
+        object: Object,
+    ) -> Result<CK_OBJECT_HANDLE> {
+        let handle = self.allocate_handle()?;
+        self.objects.insert(handle, object);
+        self.temporary_owners.insert(handle, session);
+        self.query_cache.cache_clear();
+        Ok(handle)
+    }
+
+    pub fn destroy_session_object(
+        &mut self,
+        _session: CK_SESSION_HANDLE,
+        handle: CK_OBJECT_HANDLE,
+    ) -> Result<()> {
+        match self.temporary_owners.get(&handle) {
+            Some(_) => {
+                self.temporary_owners.remove(&handle);
+                self.objects.remove(&handle);
+                self.query_cache.cache_clear();
+                Ok(())
+            }
+            None => Err(Error::ObjectHandleInvalid(handle)),
+        }
+    }
+
+    pub fn destroy_session_objects(&mut self, session: CK_SESSION_HANDLE) {
+        let handles: Vec<_> = self
+            .temporary_owners
+            .iter()
+            .filter_map(|(handle, owner)| (*owner == session).then_some(*handle))
+            .collect();
+        for handle in handles {
+            self.temporary_owners.remove(&handle);
+            self.objects.remove(&handle);
+        }
+        self.query_cache.cache_clear();
+    }
+
+    pub fn clear_session_objects(&mut self) {
+        let handles: Vec<_> = self.temporary_owners.keys().copied().collect();
+        for handle in handles {
+            self.temporary_owners.remove(&handle);
+            self.objects.remove(&handle);
+        }
+        self.query_cache.cache_clear();
     }
 
     #[instrument(skip(self))]
@@ -135,12 +191,16 @@ impl ObjectStore {
                     return Ok(());
                 };
                 match *class {
-                    CKO_PRIVATE_KEY => backend().find_private_key(opts)?.map(|key| {
-                        self.insert(Object::PrivateKey(key));
-                    }),
-                    CKO_PUBLIC_KEY => backend().find_public_key(opts)?.map(|key| {
-                        self.insert(Object::PublicKey(key.into()));
-                    }),
+                    CKO_PRIVATE_KEY => {
+                        if let Some(key) = backend().find_private_key(opts)? {
+                            self.insert(Object::PrivateKey(key))?;
+                        }
+                    }
+                    CKO_PUBLIC_KEY => {
+                        if let Some(key) = backend().find_public_key(opts)? {
+                            self.insert(Object::PublicKey(key.into()))?;
+                        }
+                    }
                     _ => unreachable!(),
                 };
             }
@@ -153,21 +213,21 @@ impl ObjectStore {
 
     fn find_with_backend_all_certificates(&mut self) -> Result<()> {
         for cert in backend().find_all_certificates()? {
-            self.insert(Object::Certificate(cert.into()));
+            self.insert(Object::Certificate(cert.into()))?;
         }
         Ok(())
     }
 
     fn find_with_backend_all_public_keys(&mut self) -> Result<()> {
         for public_key in backend().find_all_public_keys()? {
-            self.insert(Object::PublicKey(public_key));
+            self.insert(Object::PublicKey(public_key))?;
         }
         Ok(())
     }
 
     fn find_with_backend_all_private_keys(&mut self) -> Result<()> {
         for private_key in backend().find_all_private_keys()? {
-            self.insert(Object::PrivateKey(private_key));
+            self.insert(Object::PrivateKey(private_key))?;
         }
         Ok(())
     }
@@ -178,6 +238,7 @@ impl Default for ObjectStore {
         Self {
             objects: HashMap::from([(1, Object::Profile(CKP_BASELINE_PROVIDER))]),
             handles_by_object: HashMap::from([(Object::Profile(CKP_BASELINE_PROVIDER), 1)]),
+            temporary_owners: HashMap::new(),
             next_object_handle: 2,
             query_cache: TtlCache::builder()
                 .ttl(Duration::from_secs(10))
@@ -189,13 +250,15 @@ impl Default for ObjectStore {
 
 #[cfg(test)]
 mod tests {
-    use std::vec;
+    use std::{sync::Arc, vec};
 
     use native_pkcs11_traits::{KeyAlgorithm, backend, random_label};
+    use p256::ecdsa::SigningKey;
     use pkcs11_sys::CKO_PRIVATE_KEY;
     use serial_test::serial;
 
     use super::*;
+    use crate::session_public_key::SessionPublicKey;
     use crate::tests::test_init;
 
     #[test]
@@ -238,5 +301,75 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    #[test]
+    fn session_objects_are_owned_and_destroyed() {
+        let mut store = ObjectStore::default();
+        let signing_key = SigningKey::from_bytes((&[7u8; 32]).into()).unwrap();
+        let key = SessionPublicKey::from_sec1(
+            signing_key.verifying_key().to_encoded_point(false).as_bytes().to_vec(),
+        )
+        .unwrap();
+        let handle =
+            store.insert_session_object(3, Object::SessionPublicKey(Arc::new(key))).unwrap();
+
+        assert!(store.get(&handle).is_some());
+        assert!(store.destroy_session_object(4, handle).is_ok());
+        assert!(store.get(&handle).is_none());
+        assert!(store.destroy_session_object(3, handle).is_err());
+    }
+
+    #[test]
+    fn closing_a_session_removes_only_its_temporary_objects() {
+        let mut store = ObjectStore::default();
+        let point = SigningKey::from_bytes((&[7u8; 32]).into())
+            .unwrap()
+            .verifying_key()
+            .to_encoded_point(false)
+            .as_bytes()
+            .to_vec();
+        let first = store
+            .insert_session_object(
+                3,
+                Object::SessionPublicKey(Arc::new(
+                    SessionPublicKey::from_sec1(point.clone()).unwrap(),
+                )),
+            )
+            .unwrap();
+        let second = store
+            .insert_session_object(
+                4,
+                Object::SessionPublicKey(Arc::new(SessionPublicKey::from_sec1(point).unwrap())),
+            )
+            .unwrap();
+
+        store.destroy_session_objects(3);
+        assert!(store.get(&first).is_none());
+        assert!(store.get(&second).is_some());
+        store.clear_session_objects();
+        assert!(store.get(&second).is_none());
+    }
+
+    #[test]
+    fn session_mutations_invalidate_queries_and_handle_exhaustion_is_fallible() {
+        let mut store = ObjectStore::default();
+        let template = Attributes::from(Vec::<Attribute>::new());
+        store.query_cache.cache_set(template.clone(), vec![99]);
+        let signing_key = SigningKey::from_bytes((&[37u8; 32]).into()).unwrap();
+        let point = signing_key.verifying_key().to_encoded_point(false).as_bytes().to_vec();
+        let key = SessionPublicKey::from_sec1(point).unwrap();
+        let handle =
+            store.insert_session_object(7, Object::SessionPublicKey(Arc::new(key))).unwrap();
+        assert!(store.query_cache.cache_get(&template).is_none());
+        store.query_cache.cache_set(template.clone(), vec![handle]);
+        store.destroy_session_object(8, handle).unwrap();
+        assert!(store.query_cache.cache_get(&template).is_none());
+
+        store.next_object_handle = CK_OBJECT_HANDLE::MAX;
+        assert!(matches!(
+            store.insert_session_object(7, Object::Profile(CKP_BASELINE_PROVIDER)),
+            Err(Error::ObjectHandleExhausted)
+        ));
     }
 }

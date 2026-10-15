@@ -446,6 +446,7 @@ name = "native-pkcs11"
 version = "0.2.27"
 dependencies = [
  "cached",
+ "der 0.8.2",
  "native-pkcs11-core",
  "native-pkcs11-keychain",
  "native-pkcs11-traits",

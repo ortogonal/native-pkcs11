@@ -13,9 +13,11 @@ custom-function-list = []
 
 [dependencies]
 cached = { version = "~4.0", default-features = false, features = ["time_stores"] }
+der = "0.8.2"
 native-pkcs11-core = { version = "^0.2.26", path = "../native-pkcs11-core" }
 native-pkcs11-traits = { version = "0.2.25", path = "../native-pkcs11-traits" }
 pkcs11-sys = { version = "0.2.25", path = "../pkcs11-sys" }
+p256 = { version = "0.13", features = ["ecdsa"] }
 thiserror = "2"
 tracing = "0.1.44"
 tracing-error = "0.2.1"

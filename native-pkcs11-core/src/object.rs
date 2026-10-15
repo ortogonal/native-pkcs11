@@ -93,6 +93,7 @@ pub enum Object<
     PrivateKey(Arc<DynPrivateKey>),
     Profile(CK_PROFILE_ID),
     PublicKey(Arc<DynPublicKey>),
+    SessionPublicKey(Arc<DynPublicKey>),
 }
 
 impl Clone for Object {
@@ -102,11 +103,21 @@ impl Clone for Object {
             Object::PrivateKey(private_key) => Object::PrivateKey(private_key.clone()),
             Object::Profile(id) => Object::Profile(*id),
             Object::PublicKey(public_key) => Object::PublicKey(public_key.clone()),
+            Object::SessionPublicKey(public_key) => Object::SessionPublicKey(public_key.clone()),
         }
     }
 }
 
 impl Object {
+    pub fn public_key(&self) -> Option<&Arc<dyn PublicKey>> {
+        match self {
+            Object::PublicKey(public_key) | Object::SessionPublicKey(public_key) => {
+                Some(public_key)
+            }
+            _ => None,
+        }
+    }
+
     pub fn attribute(&self, type_: AttributeType) -> Option<Attribute> {
         match self {
             Object::Certificate(cert) => match type_ {
@@ -225,6 +236,13 @@ impl Object {
                     debug!("public_key: type_ unimplemented: {:?}", type_);
                     None
                 }
+            },
+            Object::SessionPublicKey(pk) => match type_ {
+                AttributeType::Derive => Some(Attribute::Derive(false)),
+                AttributeType::Private => Some(Attribute::Private(false)),
+                AttributeType::Token => Some(Attribute::Token(false)),
+                AttributeType::Verify => Some(Attribute::Verify(true)),
+                _ => Object::PublicKey(pk.clone()).attribute(type_),
             },
         }
     }

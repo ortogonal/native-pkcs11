@@ -22,11 +22,13 @@ use tracing::metadata::LevelFilter;
 use tracing_error::ErrorLayer;
 use tracing_subscriber::{EnvFilter, Registry, fmt::format::FmtSpan, prelude::*};
 mod object_store;
+mod session_public_key;
 mod sessions;
 mod utils;
 
 use std::{
     cmp,
+    collections::HashSet,
     slice,
     sync::{
         Once,
@@ -34,8 +36,9 @@ use std::{
     },
 };
 
+use der::{Decode, asn1::OctetString};
 use native_pkcs11_core::{
-    attribute::{Attribute, Attributes},
+    attribute::{Attribute, AttributeType, Attributes},
     mechanism::{SUPPORTED_SIGNATURE_MECHANISMS, parse_mechanism},
     object::{self, Object},
 };
@@ -43,6 +46,7 @@ use pkcs11_sys::*;
 
 use crate::{
     sessions::{FindContext, SignContext},
+    session_public_key::SessionPublicKey,
     utils::right_pad_string_to_array,
 };
 
@@ -53,6 +57,7 @@ const SLOT_DESCRIPTION: &[u8; 64] =
 const SLOT_ID: CK_SLOT_ID = 1;
 const TOKEN_MODEL: &[u8; 16] = b"software        ";
 const TOKEN_SERIAL_NUMBER: &[u8; 16] = b"0000000000000000";
+const P256_EC_PARAMS_DER: &[u8] = &[0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07];
 
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
 
@@ -211,6 +216,126 @@ pub static mut FUNC_LIST: CK_FUNCTION_LIST = CK_FUNCTION_LIST {
 
 static TRACING_INIT: Once = Once::new();
 
+#[derive(Debug)]
+struct SessionPublicKeyTemplate {
+    id: Vec<u8>,
+    label: String,
+    point: Vec<u8>,
+}
+
+unsafe fn copy_template_attributes(
+    pTemplate: CK_ATTRIBUTE_PTR,
+    ulCount: CK_ULONG,
+) -> std::result::Result<Vec<(CK_ATTRIBUTE_TYPE, Vec<u8>)>, Error> {
+    let count: usize = ulCount.try_into()?;
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    if pTemplate.is_null() {
+        return Err(Error::ArgumentsBad);
+    }
+    let attrs = unsafe { slice::from_raw_parts(pTemplate, count) };
+    attrs
+        .iter()
+        .map(|attr| {
+            let len: usize = attr.ulValueLen.try_into()?;
+            if len > 0 && attr.pValue.is_null() {
+                return Err(Error::ArgumentsBad);
+            }
+            let value = if len == 0 {
+                Vec::new()
+            } else {
+                unsafe { slice::from_raw_parts(attr.pValue.cast::<u8>(), len) }.to_vec()
+            };
+            Ok((attr.type_, value))
+        })
+        .collect()
+}
+
+fn parse_ulong(value: &[u8], type_: AttributeType) -> std::result::Result<CK_ULONG, Error> {
+    value.try_into().map(CK_ULONG::from_ne_bytes).map_err(|_| Error::AttributeValueInvalid(type_))
+}
+
+fn parse_bool(value: &[u8], type_: AttributeType) -> std::result::Result<bool, Error> {
+    let value: [u8; std::mem::size_of::<CK_BBOOL>()] = match value.try_into() {
+        Ok(value) => value,
+        Err(_) => return Err(Error::AttributeValueInvalid(type_)),
+    };
+    match CK_BBOOL::from_ne_bytes(value) {
+        CK_FALSE => Ok(false),
+        CK_TRUE => Ok(true),
+        _ => Err(Error::AttributeValueInvalid(type_)),
+    }
+}
+
+fn parse_session_public_key_template(
+    attrs: &[(CK_ATTRIBUTE_TYPE, Vec<u8>)],
+) -> std::result::Result<SessionPublicKeyTemplate, Error> {
+    let mut seen = HashSet::new();
+    let mut class = None;
+    let mut key_type = None;
+    let mut token = false;
+    let mut private = false;
+    let mut verify = true;
+    let mut params = None;
+    let mut point = None;
+    let mut id = Vec::new();
+    let mut label = String::new();
+
+    for (type_, value) in attrs {
+        if !seen.insert(*type_) {
+            return Err(Error::TemplateInconsistent);
+        }
+        let attr_type = match (*type_).try_into() {
+            Ok(type_) => type_,
+            Err(_) => return Err(Error::AttributeTypeInvalid(*type_)),
+        };
+        match attr_type {
+            AttributeType::Class => class = Some(parse_ulong(value, attr_type)?),
+            AttributeType::KeyType => key_type = Some(parse_ulong(value, attr_type)?),
+            AttributeType::Token => token = parse_bool(value, attr_type)?,
+            AttributeType::Private => private = parse_bool(value, attr_type)?,
+            AttributeType::Verify => verify = parse_bool(value, attr_type)?,
+            AttributeType::Derive => {
+                if parse_bool(value, attr_type)? {
+                    return Err(Error::TemplateInconsistent);
+                }
+            }
+            AttributeType::EcParams => {
+                if value.as_slice() != P256_EC_PARAMS_DER {
+                    return Err(Error::AttributeValueInvalid(attr_type));
+                }
+                params = Some(value.clone());
+            }
+            AttributeType::EcPoint => {
+                let point_der = OctetString::from_der(value)
+                    .map_err(|_| Error::AttributeValueInvalid(attr_type))?;
+                point = Some(point_der.as_bytes().to_vec());
+            }
+            AttributeType::Id => id = value.clone(),
+            AttributeType::Label => {
+                label = String::from_utf8(value.clone())
+                    .map_err(|_| Error::AttributeValueInvalid(attr_type))?;
+            }
+            _ => return Err(Error::AttributeTypeInvalid(*type_)),
+        }
+    }
+
+    if token || private || !verify {
+        return Err(Error::TemplateInconsistent);
+    }
+    if class.is_none() || key_type.is_none() || params.is_none() || point.is_none() {
+        return Err(Error::TemplateIncomplete);
+    }
+    if class != Some(CKO_PUBLIC_KEY as CK_ULONG) {
+        return Err(Error::AttributeValueInvalid(AttributeType::Class));
+    }
+    if key_type != Some(CKK_EC as CK_ULONG) {
+        return Err(Error::AttributeValueInvalid(AttributeType::KeyType));
+    }
+    Ok(SessionPublicKeyTemplate { id, label, point: point.unwrap() })
+}
+
 cryptoki_fn!(
     fn C_Initialize(pInitArgs: CK_VOID_PTR) {
         TRACING_INIT.call_once(|| {
@@ -255,6 +380,8 @@ cryptoki_fn!(
         if !pReserved.is_null() {
             return Err(Error::ArgumentsBad);
         }
+        sessions::close_all();
+        sessions::OBJECT_STORE.lock().unwrap().clear_session_objects();
         INITIALIZED.store(false, Ordering::SeqCst);
         Ok(())
     }
@@ -346,7 +473,11 @@ cryptoki_fn!(
             manufacturerID: *MANUFACTURER_ID,
             model: *TOKEN_MODEL,
             serialNumber: *TOKEN_SERIAL_NUMBER,
-            flags: CKF_TOKEN_INITIALIZED | CKF_PROTECTED_AUTHENTICATION_PATH | CKF_WRITE_PROTECTED,
+            // Temporary public-key session objects are required by the
+            // provider's peer-certificate verification path. Do not advertise
+            // write protection; persistent and private-key object creation
+            // remain rejected below.
+            flags: CKF_TOKEN_INITIALIZED | CKF_PROTECTED_AUTHENTICATION_PATH,
             ulMaxSessionCount: CK_UNAVAILABLE_INFORMATION,
             ulSessionCount: CK_UNAVAILABLE_INFORMATION,
             ulMaxRwSessionCount: CK_UNAVAILABLE_INFORMATION,
@@ -463,6 +594,7 @@ cryptoki_fn!(
     fn C_CloseSession(hSession: CK_SESSION_HANDLE) {
         initialized!();
         if sessions::close(hSession) {
+            sessions::OBJECT_STORE.lock().unwrap().destroy_session_objects(hSession);
             return Ok(());
         }
         Err(Error::SessionHandleInvalid(hSession))
@@ -474,6 +606,7 @@ cryptoki_fn!(
         initialized!();
         valid_slot!(slotID);
         sessions::close_all();
+        sessions::OBJECT_STORE.lock().unwrap().clear_session_objects();
         Ok(())
     }
 );
@@ -529,12 +662,28 @@ cryptoki_fn!(
     }
 );
 
-cryptoki_fn_not_supported!(
-    C_CreateObject,
-    hSession: CK_SESSION_HANDLE,
-    pTemplate: CK_ATTRIBUTE_PTR,
-    ulCount: CK_ULONG,
-    phObject: CK_OBJECT_HANDLE_PTR
+cryptoki_fn!(
+    unsafe fn C_CreateObject(
+        hSession: CK_SESSION_HANDLE,
+        pTemplate: CK_ATTRIBUTE_PTR,
+        ulCount: CK_ULONG,
+        phObject: CK_OBJECT_HANDLE_PTR,
+    ) {
+        initialized!();
+        valid_session!(hSession);
+        not_null!(phObject);
+        let attrs = unsafe { copy_template_attributes(pTemplate, ulCount)? };
+        let template = parse_session_public_key_template(&attrs)?;
+        let key = SessionPublicKey::new(template.point, template.id, template.label)
+            .ok_or(Error::AttributeValueInvalid(AttributeType::EcPoint))?;
+        let handle = sessions::OBJECT_STORE
+            .lock()
+            .unwrap()
+            .insert_session_object(hSession, Object::SessionPublicKey(std::sync::Arc::new(key)))?;
+        unsafe { *phObject = handle };
+        tracing::info!(session = hSession, handle, "created temporary public key");
+        Ok(())
+    }
 );
 
 cryptoki_fn_not_supported!(
@@ -546,10 +695,12 @@ cryptoki_fn_not_supported!(
     phNewObject: CK_OBJECT_HANDLE_PTR
 );
 
-cryptoki_fn_not_supported!(
-    C_DestroyObject,
-    hSession: CK_SESSION_HANDLE,
-    hObject: CK_OBJECT_HANDLE
+cryptoki_fn!(
+    fn C_DestroyObject(hSession: CK_SESSION_HANDLE, hObject: CK_OBJECT_HANDLE) {
+        initialized!();
+        valid_session!(hSession);
+        sessions::OBJECT_STORE.lock().unwrap().destroy_session_object(hSession, hObject)
+    }
 );
 
 cryptoki_fn_not_supported!(
@@ -629,7 +780,14 @@ cryptoki_fn!(
     ) {
         initialized!();
         valid_session!(hSession);
-        let template: Attributes = unsafe { slice::from_raw_parts(pTemplate, ulCount as usize) }
+        let template_attrs: &[CK_ATTRIBUTE] = if ulCount == 0 {
+            &[]
+        } else {
+            not_null!(pTemplate);
+            let count: usize = ulCount.try_into()?;
+            unsafe { slice::from_raw_parts(pTemplate, count) }
+        };
+        let template: Attributes = template_attrs
             .iter()
             .map(|attr| (*attr).try_into())
             .collect::<native_pkcs11_core::Result<Vec<Attribute>>>()?
@@ -1072,6 +1230,7 @@ cryptoki_fn_not_supported!(
 pub mod tests {
     use std::ptr;
 
+    use der::Encode;
     use serial_test::serial;
 
     use super::*;
@@ -1491,6 +1650,347 @@ pub mod tests {
             CKR_OK
         );
         assert_eq!(C_GetFunctionStatus(session_h), CKR_FUNCTION_NOT_PARALLEL);
+        assert_eq!(C_Finalize(ptr::null_mut()), CKR_OK);
+    }
+
+    #[test]
+    #[serial]
+    fn rejects_persistent_and_private_session_object_templates() {
+        test_init();
+        assert_eq!(C_Initialize(ptr::null_mut()), CKR_OK);
+        let mut session = CK_INVALID_HANDLE;
+        assert_eq!(
+            unsafe {
+                C_OpenSession(
+                    SLOT_ID,
+                    CKF_SERIAL_SESSION | CKF_RW_SESSION,
+                    ptr::null_mut(),
+                    None,
+                    &mut session,
+                )
+            },
+            CKR_OK
+        );
+
+        let mut class = CKO_PUBLIC_KEY as CK_ULONG;
+        let mut key_type = CKK_EC as CK_ULONG;
+        let mut token = CK_TRUE;
+        let mut template = [
+            CK_ATTRIBUTE {
+                type_: CKA_CLASS,
+                pValue: (&mut class as *mut CK_ULONG).cast(),
+                ulValueLen: std::mem::size_of::<CK_ULONG>() as CK_ULONG,
+            },
+            CK_ATTRIBUTE {
+                type_: CKA_KEY_TYPE,
+                pValue: (&mut key_type as *mut CK_ULONG).cast(),
+                ulValueLen: std::mem::size_of::<CK_ULONG>() as CK_ULONG,
+            },
+            CK_ATTRIBUTE {
+                type_: CKA_TOKEN,
+                pValue: (&mut token as *mut CK_BBOOL).cast(),
+                ulValueLen: std::mem::size_of::<CK_BBOOL>() as CK_ULONG,
+            },
+        ];
+        let mut handle = CK_INVALID_HANDLE;
+        assert_eq!(
+            unsafe {
+                C_CreateObject(
+                    session,
+                    template.as_mut_ptr(),
+                    template.len() as CK_ULONG,
+                    &mut handle,
+                )
+            },
+            CKR_TEMPLATE_INCONSISTENT
+        );
+
+        let mut private_class = CKO_PRIVATE_KEY as CK_ULONG;
+        let mut private_token = CK_FALSE;
+        let private_template = [
+            CK_ATTRIBUTE {
+                type_: CKA_CLASS,
+                pValue: (&mut private_class as *mut CK_ULONG).cast(),
+                ulValueLen: std::mem::size_of::<CK_ULONG>() as CK_ULONG,
+            },
+            CK_ATTRIBUTE {
+                type_: CKA_KEY_TYPE,
+                pValue: (&mut key_type as *mut CK_ULONG).cast(),
+                ulValueLen: std::mem::size_of::<CK_ULONG>() as CK_ULONG,
+            },
+            CK_ATTRIBUTE {
+                type_: CKA_TOKEN,
+                pValue: (&mut private_token as *mut CK_BBOOL).cast(),
+                ulValueLen: std::mem::size_of::<CK_BBOOL>() as CK_ULONG,
+            },
+        ];
+        assert_eq!(
+            unsafe {
+                C_CreateObject(
+                    session,
+                    private_template.as_ptr() as *mut CK_ATTRIBUTE,
+                    private_template.len() as CK_ULONG,
+                    &mut handle,
+                )
+            },
+            CKR_TEMPLATE_INCOMPLETE
+        );
+        assert_eq!(C_CloseSession(session), CKR_OK);
+        assert_eq!(C_Finalize(ptr::null_mut()), CKR_OK);
+    }
+
+    #[test]
+    fn session_template_defaults_and_validation() {
+        use p256::ecdsa::SigningKey;
+
+        let signing_key = SigningKey::from_bytes((&[23u8; 32]).into()).unwrap();
+        let point = signing_key.verifying_key().to_encoded_point(false);
+        let point_der = OctetString::new(point.as_bytes().to_vec()).unwrap().to_der().unwrap();
+        let attrs = vec![
+            (CKA_CLASS, (CKO_PUBLIC_KEY as CK_ULONG).to_ne_bytes().to_vec()),
+            (CKA_KEY_TYPE, (CKK_EC as CK_ULONG).to_ne_bytes().to_vec()),
+            (CKA_EC_PARAMS, P256_EC_PARAMS_DER.to_vec()),
+            (CKA_EC_POINT, point_der),
+        ];
+        let template = parse_session_public_key_template(&attrs).unwrap();
+        assert_eq!(template.point, point.as_bytes());
+        assert!(template.id.is_empty());
+        assert!(template.label.is_empty());
+
+        let mut duplicate = attrs.clone();
+        duplicate.push((CKA_TOKEN, vec![CK_FALSE]));
+        duplicate.push((CKA_TOKEN, vec![CK_FALSE]));
+        assert!(matches!(
+            parse_session_public_key_template(&duplicate),
+            Err(Error::TemplateInconsistent)
+        ));
+
+        let mut persistent = attrs.clone();
+        persistent.push((CKA_TOKEN, vec![CK_TRUE]));
+        assert!(matches!(
+            parse_session_public_key_template(&persistent),
+            Err(Error::TemplateInconsistent)
+        ));
+
+        let mut unsupported = attrs.clone();
+        unsupported.push((CKA_MODIFIABLE, vec![CK_TRUE]));
+        assert!(matches!(
+            parse_session_public_key_template(&unsupported),
+            Err(Error::AttributeTypeInvalid(CKA_MODIFIABLE))
+        ));
+
+        let mut derive_false = attrs.clone();
+        derive_false.push((CKA_DERIVE, vec![CK_FALSE]));
+        assert!(parse_session_public_key_template(&derive_false).is_ok());
+
+        let mut derive_true = attrs.clone();
+        derive_true.push((CKA_DERIVE, vec![CK_TRUE]));
+        assert!(matches!(
+            parse_session_public_key_template(&derive_true),
+            Err(Error::TemplateInconsistent)
+        ));
+
+        let mut invalid_derive = attrs;
+        invalid_derive.push((CKA_DERIVE, vec![2]));
+        assert!(matches!(
+            parse_session_public_key_template(&invalid_derive),
+            Err(Error::AttributeValueInvalid(AttributeType::Derive))
+        ));
+    }
+
+    #[test]
+    fn session_template_rejects_missing_and_malformed_values() {
+        use p256::ecdsa::SigningKey;
+
+        let signing_key = SigningKey::from_bytes((&[29u8; 32]).into()).unwrap();
+        let point = signing_key.verifying_key().to_encoded_point(false);
+        let point_der = OctetString::new(point.as_bytes().to_vec()).unwrap().to_der().unwrap();
+        let base = vec![
+            (CKA_CLASS, (CKO_PUBLIC_KEY as CK_ULONG).to_ne_bytes().to_vec()),
+            (CKA_KEY_TYPE, (CKK_EC as CK_ULONG).to_ne_bytes().to_vec()),
+            (CKA_EC_PARAMS, P256_EC_PARAMS_DER.to_vec()),
+            (CKA_EC_POINT, point_der),
+        ];
+        for missing in 0..base.len() {
+            let mut attrs = base.clone();
+            attrs.remove(missing);
+            assert!(matches!(
+                parse_session_public_key_template(&attrs),
+                Err(Error::TemplateIncomplete)
+            ));
+        }
+
+        let mut wrong_curve = base.clone();
+        wrong_curve[2] =
+            (CKA_EC_PARAMS, vec![0x06, 0x08, 0x2B, 0x81, 0x04, 0x00, 0x22, 0x03, 0x01, 0x01]);
+        assert!(matches!(
+            parse_session_public_key_template(&wrong_curve),
+            Err(Error::AttributeValueInvalid(AttributeType::EcParams))
+        ));
+
+        let mut malformed_point = base;
+        malformed_point[3] = (CKA_EC_POINT, vec![0x04, 0x02, 0x04]);
+        assert!(matches!(
+            parse_session_public_key_template(&malformed_point),
+            Err(Error::AttributeValueInvalid(AttributeType::EcPoint))
+        ));
+    }
+
+    #[test]
+    fn session_object_attributes_and_cross_session_lifetime() {
+        use native_pkcs11_core::object::Object;
+        use p256::ecdsa::SigningKey;
+        use std::sync::Arc;
+
+        let signing_key = SigningKey::from_bytes((&[31u8; 32]).into()).unwrap();
+        let point = signing_key.verifying_key().to_encoded_point(false).as_bytes().to_vec();
+        let key = SessionPublicKey::new(point.clone(), b"id".to_vec(), "label".to_owned()).unwrap();
+        let object =
+            Object::SessionPublicKey(Arc::new(key) as Arc<dyn native_pkcs11_traits::PublicKey>);
+        assert_eq!(object.attribute(AttributeType::Class), Some(Attribute::Class(CKO_PUBLIC_KEY)));
+        assert_eq!(object.attribute(AttributeType::KeyType), Some(Attribute::KeyType(CKK_EC)));
+        assert_eq!(object.attribute(AttributeType::Token), Some(Attribute::Token(false)));
+        assert_eq!(object.attribute(AttributeType::Private), Some(Attribute::Private(false)));
+        assert_eq!(object.attribute(AttributeType::Verify), Some(Attribute::Verify(true)));
+        let ec_point = match object.attribute(AttributeType::EcPoint).unwrap() {
+            Attribute::EcPoint(value) => OctetString::from_der(&value).unwrap(),
+            other => panic!("unexpected attribute: {other:?}"),
+        };
+        assert_eq!(ec_point.as_bytes(), point.as_slice());
+        assert!(matches!(
+            object.attribute(AttributeType::PublicKeyInfo),
+            Some(Attribute::PublicKeyInfo(_))
+        ));
+
+        let mut store = sessions::OBJECT_STORE.lock().unwrap();
+        let handle = store.insert_session_object(101, object).unwrap();
+        assert!(store.get(&handle).is_some());
+        assert!(store.destroy_session_object(102, handle).is_ok());
+        assert!(store.get(&handle).is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn creates_valid_session_key_with_default_token_and_reports_attributes() {
+        use p256::ecdsa::SigningKey;
+
+        test_init();
+        assert_eq!(C_Initialize(ptr::null_mut()), CKR_OK);
+        let mut first = CK_INVALID_HANDLE;
+        let mut second = CK_INVALID_HANDLE;
+        assert_eq!(
+            unsafe {
+                C_OpenSession(SLOT_ID, CKF_SERIAL_SESSION, ptr::null_mut(), None, &mut first)
+            },
+            CKR_OK
+        );
+        assert_eq!(
+            unsafe {
+                C_OpenSession(SLOT_ID, CKF_SERIAL_SESSION, ptr::null_mut(), None, &mut second)
+            },
+            CKR_OK
+        );
+
+        let signing_key = SigningKey::from_bytes((&[41u8; 32]).into()).unwrap();
+        let point = signing_key.verifying_key().to_encoded_point(false);
+        let point_der = OctetString::new(point.as_bytes().to_vec()).unwrap().to_der().unwrap();
+        let mut class = CKO_PUBLIC_KEY as CK_ULONG;
+        let mut key_type = CKK_EC as CK_ULONG;
+        let mut params = P256_EC_PARAMS_DER.to_vec();
+        let mut derive_false = CK_FALSE;
+        let mut template = [
+            CK_ATTRIBUTE {
+                type_: CKA_CLASS,
+                pValue: (&mut class as *mut CK_ULONG).cast(),
+                ulValueLen: std::mem::size_of::<CK_ULONG>() as CK_ULONG,
+            },
+            CK_ATTRIBUTE {
+                type_: CKA_KEY_TYPE,
+                pValue: (&mut key_type as *mut CK_ULONG).cast(),
+                ulValueLen: std::mem::size_of::<CK_ULONG>() as CK_ULONG,
+            },
+            CK_ATTRIBUTE {
+                type_: CKA_EC_PARAMS,
+                pValue: params.as_mut_ptr().cast(),
+                ulValueLen: params.len() as CK_ULONG,
+            },
+            CK_ATTRIBUTE {
+                type_: CKA_EC_POINT,
+                pValue: point_der.as_ptr() as *mut _,
+                ulValueLen: point_der.len() as CK_ULONG,
+            },
+            CK_ATTRIBUTE {
+                type_: CKA_DERIVE,
+                pValue: (&mut derive_false as *mut CK_BBOOL).cast(),
+                ulValueLen: std::mem::size_of::<CK_BBOOL>() as _,
+            },
+        ];
+        let mut object = CK_INVALID_HANDLE;
+        assert_eq!(
+            unsafe {
+                C_CreateObject(first, template.as_mut_ptr(), template.len() as _, &mut object)
+            },
+            CKR_OK
+        );
+
+        let mut token = CK_BBOOL::default();
+        let mut private = CK_BBOOL::default();
+        let mut verify = CK_BBOOL::default();
+        let mut attributes = [
+            CK_ATTRIBUTE {
+                type_: CKA_TOKEN,
+                pValue: (&mut token as *mut CK_BBOOL).cast(),
+                ulValueLen: std::mem::size_of::<CK_BBOOL>() as _,
+            },
+            CK_ATTRIBUTE {
+                type_: CKA_PRIVATE,
+                pValue: (&mut private as *mut CK_BBOOL).cast(),
+                ulValueLen: std::mem::size_of::<CK_BBOOL>() as _,
+            },
+            CK_ATTRIBUTE {
+                type_: CKA_VERIFY,
+                pValue: (&mut verify as *mut CK_BBOOL).cast(),
+                ulValueLen: std::mem::size_of::<CK_BBOOL>() as _,
+            },
+            CK_ATTRIBUTE {
+                type_: CKA_DERIVE,
+                pValue: (&mut derive_false as *mut CK_BBOOL).cast(),
+                ulValueLen: std::mem::size_of::<CK_BBOOL>() as _,
+            },
+        ];
+        assert_eq!(
+            unsafe {
+                C_GetAttributeValue(second, object, attributes.as_mut_ptr(), attributes.len() as _)
+            },
+            CKR_OK
+        );
+        assert_eq!((token, private, verify, derive_false), (CK_FALSE, CK_FALSE, CK_TRUE, CK_FALSE));
+        assert_eq!(C_DestroyObject(second, object), CKR_OK);
+        assert_eq!(C_DestroyObject(first, object), CKR_OBJECT_HANDLE_INVALID);
+
+        let mut derive_true = CK_TRUE;
+        template[4].pValue = (&mut derive_true as *mut CK_BBOOL).cast();
+        let mut rejected_object = CK_INVALID_HANDLE;
+        assert_eq!(
+            unsafe {
+                C_CreateObject(
+                    first,
+                    template.as_mut_ptr(),
+                    template.len() as _,
+                    &mut rejected_object,
+                )
+            },
+            CKR_TEMPLATE_INCONSISTENT
+        );
+        assert_eq!(rejected_object, CK_INVALID_HANDLE);
+        let mut rejected_attribute =
+            CK_ATTRIBUTE { type_: CKA_CLASS, pValue: ptr::null_mut(), ulValueLen: 0 };
+        assert_eq!(
+            unsafe { C_GetAttributeValue(first, rejected_object, &mut rejected_attribute, 1) },
+            CKR_OBJECT_HANDLE_INVALID
+        );
+        assert_eq!(C_CloseSession(first), CKR_OK);
+        assert_eq!(C_CloseSession(second), CKR_OK);
         assert_eq!(C_Finalize(ptr::null_mut()), CKR_OK);
     }
 }

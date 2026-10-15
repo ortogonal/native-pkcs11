@@ -61,6 +61,15 @@ pub enum Error {
     #[error("object {0} is invalid")]
     ObjectHandleInvalid(CK_OBJECT_HANDLE),
 
+    #[error("object handle space is exhausted")]
+    ObjectHandleExhausted,
+
+    #[error("the object template is incomplete")]
+    TemplateIncomplete,
+
+    #[error("the object template is inconsistent")]
+    TemplateInconsistent,
+
     #[error("operation has not been initialized")]
     OperationNotInitialized,
 
@@ -122,12 +131,15 @@ impl From<Error> for CK_RV {
             Error::MechanismInvalid(_) => CKR_MECHANISM_INVALID,
             Error::NeedToCreateThreads => CKR_NEED_TO_CREATE_THREADS,
             Error::ObjectHandleInvalid(_) => CKR_OBJECT_HANDLE_INVALID,
+            Error::ObjectHandleExhausted => CKR_GENERAL_ERROR,
             Error::OperationNotInitialized => CKR_OPERATION_NOT_INITIALIZED,
             Error::RandomNoRng => CKR_RANDOM_NO_RNG,
             Error::SessionHandleInvalid(_) => CKR_SESSION_HANDLE_INVALID,
             Error::SessionParallelNotSupported => CKR_SESSION_PARALLEL_NOT_SUPPORTED,
             Error::SlotIdInvalid(_) => CKR_SLOT_ID_INVALID,
             Error::TokenWriteProtected => CKR_TOKEN_WRITE_PROTECTED,
+            Error::TemplateIncomplete => CKR_TEMPLATE_INCOMPLETE,
+            Error::TemplateInconsistent => CKR_TEMPLATE_INCONSISTENT,
 
             Error::Backend(_)
             | Error::FromUtf8(_)
