@@ -50,6 +50,7 @@ pub enum AttributeType {
     PrivateExponent,
     ProfileId,
     PublicExponent,
+    PublicKeyInfo,
     Sensitive,
     SerialNumber,
     Sign,
@@ -99,6 +100,7 @@ impl TryFrom<CK_ATTRIBUTE_TYPE> for AttributeType {
             CKA_PRIVATE_EXPONENT => Ok(AttributeType::PrivateExponent),
             CKA_PROFILE_ID => Ok(AttributeType::ProfileId),
             CKA_PUBLIC_EXPONENT => Ok(AttributeType::PublicExponent),
+            CKA_PUBLIC_KEY_INFO => Ok(AttributeType::PublicKeyInfo),
             CKA_SENSITIVE => Ok(AttributeType::Sensitive),
             CKA_SIGN => Ok(AttributeType::Sign),
             CKA_SIGN_RECOVER => Ok(AttributeType::SignRecover),
@@ -148,6 +150,7 @@ pub enum Attribute {
     PrivateExponent(Vec<u8>),
     ProfileId(CK_PROFILE_ID),
     PublicExponent(Vec<u8>),
+    PublicKeyInfo(Vec<u8>),
     Sensitive(bool),
     SerialNumber(Vec<u8>),
     Sign(bool),
@@ -195,6 +198,7 @@ impl Attribute {
             Attribute::PrivateExponent(_) => AttributeType::PrivateExponent,
             Attribute::ProfileId(_) => AttributeType::ProfileId,
             Attribute::PublicExponent(_) => AttributeType::PublicExponent,
+            Attribute::PublicKeyInfo(_) => AttributeType::PublicKeyInfo,
             Attribute::Sensitive(_) => AttributeType::Sensitive,
             Attribute::SerialNumber(_) => AttributeType::SerialNumber,
             Attribute::Sign(_) => AttributeType::Sign,
@@ -252,12 +256,30 @@ impl Attribute {
             | Attribute::Prime2(bytes)
             | Attribute::PrivateExponent(bytes)
             | Attribute::PublicExponent(bytes)
+            | Attribute::PublicKeyInfo(bytes)
             | Attribute::SerialNumber(bytes)
             | Attribute::Subject(bytes)
             | Attribute::Value(bytes) => bytes.to_vec(),
             Attribute::Application(c_string) => c_string.as_bytes().to_vec(),
             Attribute::Label(string) => string.as_bytes().to_vec(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_public_key_info_attribute() {
+        assert_eq!(
+            AttributeType::try_from(CKA_PUBLIC_KEY_INFO).unwrap(),
+            AttributeType::PublicKeyInfo
+        );
+        assert_eq!(
+            Attribute::PublicKeyInfo(vec![1, 2, 3]).attribute_type(),
+            AttributeType::PublicKeyInfo
+        );
     }
 }
 
@@ -329,6 +351,7 @@ impl TryFrom<CK_ATTRIBUTE> for Attribute {
                 Ok(Attribute::ProfileId(CK_ULONG::from_ne_bytes(val.try_into()?)))
             }
             AttributeType::PublicExponent => Ok(Attribute::PublicExponent(val.to_vec())),
+            AttributeType::PublicKeyInfo => Ok(Attribute::PublicKeyInfo(val.to_vec())),
             AttributeType::Sensitive => Ok(Attribute::Sensitive(try_u8_into_bool(val)?)),
             AttributeType::SerialNumber => Ok(Attribute::SerialNumber(val.to_vec())),
             AttributeType::Subject => Ok(Attribute::Subject(val.to_vec())),

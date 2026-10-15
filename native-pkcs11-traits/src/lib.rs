@@ -105,6 +105,18 @@ impl Hash for dyn PrivateKey {
 pub trait PublicKey: Send + Sync + std::fmt::Debug {
     fn id(&self) -> Vec<u8>;
     fn label(&self) -> String;
+    /// Return DER-encoded EC parameters when this is an EC public key.
+    ///
+    /// The value has the same representation as PKCS#11 `CKA_EC_PARAMS`.
+    /// Implementations which support EC keys and can identify the named curve
+    /// should override this method. Implementations which cannot identify the
+    /// curve must return `None` rather than allowing consumers to infer it from
+    /// point length. In that case, `CKA_EC_PARAMS` and curve-dependent
+    /// `CKA_PUBLIC_KEY_INFO` are unavailable, while `CKA_EC_POINT` can still be
+    /// reported independently.
+    fn ec_params(&self) -> Option<Vec<u8>> {
+        None
+    }
     fn to_der(&self) -> Vec<u8>;
     fn verify(&self, algorithm: &SignatureAlgorithm, data: &[u8], signature: &[u8]) -> Result<()>;
     fn delete(self: Box<Self>);

@@ -14,7 +14,7 @@
 
 use std::fmt::Debug;
 
-use core_foundation::base::ToVoid;
+use core_foundation::{base::ToVoid, number::CFNumber};
 use native_pkcs11_traits::{KeyAlgorithm, PrivateKey, PublicKey, SignatureAlgorithm};
 use security_framework::{
     item::{ItemClass, KeyClass, Limit, Location, Reference},
@@ -23,6 +23,7 @@ use security_framework::{
 // TODO(bweeks,kcking): remove dependency on security-framework-sys crate.
 #[allow(deprecated)]
 use security_framework_sys::item::{
+    kSecAttrKeySizeInBits,
     kSecAttrKeyType,
     kSecAttrKeyTypeEC,
     kSecAttrKeyTypeRSA,
@@ -189,6 +190,8 @@ pub struct KeychainPublicKey {
     algorithm: KeyAlgorithm,
 }
 
+const P256_EC_PARAMS_DER: &[u8] = &[0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07];
+
 impl KeychainPublicKey {
     #[instrument]
     pub fn new(sec_key: SecKey, label: impl Into<String> + Debug) -> Result<Self> {
@@ -213,6 +216,22 @@ impl PublicKey for KeychainPublicKey {
     #[instrument]
     fn label(&self) -> String {
         self.label.clone()
+    }
+
+    fn ec_params(&self) -> Option<Vec<u8>> {
+        if self.algorithm != KeyAlgorithm::Ecc {
+            return None;
+        }
+
+        let key_size = self
+            .sec_key
+            .attributes()
+            .find(unsafe { kSecAttrKeySizeInBits }.to_void())
+            .and_then(|value| unsafe { CFNumber::wrap_under_get_rule(value.cast()) }.to_i32());
+
+        // The Security framework's EC key generator used by this backend
+        // supports P-256 (256 bits). Do not infer a curve for other sizes.
+        (key_size == Some(256)).then(|| P256_EC_PARAMS_DER.to_vec())
     }
 
     #[instrument]
